@@ -42,21 +42,56 @@ NanoClaw provides that same core functionality, but in a codebase small enough t
 
 ## Quick Start
 
+### Docker (recommended)
+
+NanoClaw runs as a Docker container that spawns agent containers as siblings. All persistent state lives in a `nanoclaw-host/` directory outside the repo.
+
 ```bash
-gh repo fork qwibitai/nanoclaw --clone
+# 1. Fork and clone
+git clone https://github.com/TBD/nanoclaw.git
 cd nanoclaw
-claude
+
+# 2. Create persistent state directory
+mkdir ../nanoclaw-host
+
+# 3. Configure environment
+cp .env.host.example .env
+# Edit .env — fill in DOCKER_HOST_REPO_PATH, DOCKER_HOST_STATE_PATH,
+# and at least one of CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY
+
+# 4. Launch
+docker compose -f docker-compose.host.yml up
 ```
 
 <details>
-<summary>Without GitHub CLI</summary>
+<summary>Path format for DOCKER_HOST_REPO_PATH / DOCKER_HOST_STATE_PATH</summary>
 
-1. Fork [qwibitai/nanoclaw](https://github.com/qwibitai/nanoclaw) on GitHub (click the Fork button)
-2. `git clone https://github.com/<your-username>/nanoclaw.git`
-3. `cd nanoclaw`
-4. `claude`
+These tell NanoClaw how to translate container-internal paths to host paths when spawning agent containers (which are siblings, not children).
+
+| Platform | Format | Example |
+|----------|--------|---------|
+| Docker Desktop (WSL 2) | Lowercase drive, forward slashes | `/c/Data/Ext/Git/nanoclaw` |
+| Linux Docker | Normal Linux paths | `/home/sean/nanoclaw` |
 
 </details>
+
+
+Once running, you can shell into the container to use Claude Code interactively:
+
+```bash
+docker exec -it nanoclaw-host bash
+claude  # Claude Code CLI is pre-installed
+```
+
+### Bare-metal (alternative)
+
+If you prefer running NanoClaw directly on your host machine:
+
+```bash
+git clone https://github.com/TBD/nanoclaw.git
+cd nanoclaw
+claude
+```
 
 Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup and service configuration.
 
@@ -142,10 +177,15 @@ Skills we'd like to see:
 
 ## Requirements
 
-- macOS or Linux
+**Docker host mode (recommended):**
+- [Docker Desktop](https://docker.com/products/docker-desktop) (macOS, Windows, or Linux)
+- A Claude credential ([OAuth token](https://claude.com/product/claude-code) or [API key](https://console.anthropic.com/))
+
+**Bare-metal mode:**
+- macOS, Linux, or Windows (WSL)
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux/Windows)
 
 ## Architecture
 
@@ -153,7 +193,7 @@ Skills we'd like to see:
 Channels --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
 ```
 
-Single Node.js process. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
+Single Node.js process. In Docker host mode, NanoClaw itself runs in a container and spawns agent containers as siblings via the mounted Docker socket. The repo is mounted read-only; persistent state (database, groups, logs) lives in a separate volume. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
 
 For the full architecture details, see [docs/SPEC.md](docs/SPEC.md).
 
@@ -172,11 +212,15 @@ Key files:
 
 **Why Docker?**
 
-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime.
+Docker provides cross-platform support (macOS, Linux, and Windows) and a mature ecosystem. The Docker host mode means you only need Docker installed — no Node.js, no build tools, no dependencies on your host machine. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime.
+
+**Can I run this on Windows?**
+
+Yes. Use Docker Desktop with the WSL 2 backend and follow the Docker quickstart. NanoClaw runs in a Linux container and spawns agent containers as siblings.
 
 **Can I run this on Linux?**
 
-Yes. Docker is the default runtime and works on both macOS and Linux. Just run `/setup`.
+Yes. Docker is the default runtime and works on macOS, Linux, and Windows. The Docker host mode (`docker compose -f docker-compose.host.yml up`) is the easiest way to get started on any platform.
 
 **Is this secure?**
 

@@ -20,22 +20,35 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
+// When running in a container, state lives in a separate mounted volume
+const STATE_DIR = process.env.NANOCLAW_STATE_DIR || PROJECT_ROOT;
+
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
+const CONFIG_DIR =
+  process.env.NANOCLAW_CONFIG_DIR ||
+  path.join(HOME_DIR, '.config', 'nanoclaw');
 export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'mount-allowlist.json',
 );
 export const SENDER_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'sender-allowlist.json',
 );
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
-export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const STORE_DIR = path.resolve(STATE_DIR, 'store');
+export const GROUPS_DIR = path.resolve(STATE_DIR, 'groups');
+export const DATA_DIR = path.resolve(STATE_DIR, 'data');
+
+// Host-path translation for sibling container mounts.
+// When NanoClaw runs in a container, docker -v paths must use host paths.
+export const DOCKER_HOST_REPO_PATH = process.env.DOCKER_HOST_REPO_PATH || '';
+export const DOCKER_HOST_STATE_PATH = process.env.DOCKER_HOST_STATE_PATH || '';
+
+// Label constants for container management
+export const NANOCLAW_LABEL = 'nanoclaw.managed=true';
+// Docker Desktop project grouping — agent containers appear under the "nanoclaw" project
+export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project=nanoclaw';
+export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service=workers';
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';

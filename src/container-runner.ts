@@ -7,13 +7,18 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  COMPOSE_PROJECT_LABEL,
+  COMPOSE_SERVICE_LABEL,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
   DATA_DIR,
+  DOCKER_HOST_REPO_PATH,
+  DOCKER_HOST_STATE_PATH,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  NANOCLAW_LABEL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -212,11 +217,36 @@ function buildVolumeMounts(
   return mounts;
 }
 
+/**
+ * Translate a local path to a host filesystem path for sibling container mounts.
+ * When NanoClaw runs inside a container, docker -v paths must reference host paths
+ * because agent containers are siblings (not children).
+ */
+function toHostPath(localPath: string): string {
+  if (!DOCKER_HOST_REPO_PATH) return localPath; // not containerized
+
+  const stateDir = process.env.NANOCLAW_STATE_DIR || '';
+  const projectRoot = process.cwd();
+
+  if (stateDir && localPath.startsWith(stateDir)) {
+    return localPath.replace(stateDir, DOCKER_HOST_STATE_PATH);
+  }
+  if (localPath.startsWith(projectRoot)) {
+    return localPath.replace(projectRoot, DOCKER_HOST_REPO_PATH);
+  }
+  return localPath;
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Labels for container management and Docker Desktop grouping
+  args.push('--label', NANOCLAW_LABEL);
+  args.push('--label', COMPOSE_PROJECT_LABEL);
+  args.push('--label', COMPOSE_SERVICE_LABEL);
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -252,10 +282,11 @@ function buildContainerArgs(
   }
 
   for (const mount of mounts) {
+    const hostPath = toHostPath(mount.hostPath);
     if (mount.readonly) {
-      args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
+      args.push(...readonlyMountArgs(hostPath, mount.containerPath));
     } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      args.push('-v', `${hostPath}:${mount.containerPath}`);
     }
   }
 

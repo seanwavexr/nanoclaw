@@ -1,0 +1,40 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates build-essential python3 sudo \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create non-root user
+RUN useradd -m -s /bin/bash nanoclaw \
+    && echo 'nanoclaw ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/nanoclaw
+
+# Working directory for compiled output and node_modules
+WORKDIR /app
+
+# Pre-install dependencies (cached layer, refreshed at startup if changed)
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Make /app owned by nanoclaw user
+RUN chown -R nanoclaw:nanoclaw /app
+
+# Entrypoint handles build + startup
+COPY host-entrypoint.sh /app/host-entrypoint.sh
+RUN chmod +x /app/host-entrypoint.sh
+
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 3001
+
+ENTRYPOINT ["/app/host-entrypoint.sh"]

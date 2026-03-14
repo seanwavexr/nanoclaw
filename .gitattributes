@@ -1,0 +1,4 @@
+# Force LF line endings for files that run inside Linux containers
+*.sh text eol=lf
+Dockerfile* text eol=lf
+host-entrypoint.sh text eol=lf

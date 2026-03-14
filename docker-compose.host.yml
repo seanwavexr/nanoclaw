@@ -1,0 +1,27 @@
+name: nanoclaw  # Docker Desktop groups all containers under this project name
+
+services:
+  nanoclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.host
+    container_name: nanoclaw-host
+    restart: unless-stopped
+    volumes:
+      - .:/app/repo
+      - ${NANOCLAW_HOST_DIR:-../nanoclaw-host}:/app/state
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "3001:3001"
+    environment:
+      # Required: host paths for sibling container volume mounts
+      - DOCKER_HOST_REPO_PATH=${DOCKER_HOST_REPO_PATH}
+      - DOCKER_HOST_STATE_PATH=${DOCKER_HOST_STATE_PATH}
+      # Credentials (at least one required)
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # NanoClaw config (auto-merged into state/.env)
+      - ASSISTANT_NAME=${ASSISTANT_NAME:-Andy}
+      - ASSISTANT_HAS_OWN_NUMBER=${ASSISTANT_HAS_OWN_NUMBER:-}
+      - TZ=${TZ:-UTC}
+      - LOG_LEVEL=${LOG_LEVEL:-info}

@@ -536,8 +536,12 @@ async function main(): Promise<void> {
     await channel.connect();
   }
   if (channels.length === 0) {
-    logger.fatal('No channels connected');
-    process.exit(1);
+    logger.fatal(
+      'No channels connected — install a channel (e.g. /add-telegram) and add its credentials to .env',
+    );
+    // In a container, block indefinitely instead of crash-looping.
+    // The user needs to configure a channel; restarting won't help.
+    await new Promise(() => {});
   }
 
   // Start subsystems (independently of connection handler)
