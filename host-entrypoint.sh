@@ -9,12 +9,26 @@ STATE_DIR="/app/state"
 # Initialize state directories
 mkdir -p "$STATE_DIR"/{store,groups/main,groups/global,data,logs,config}
 
-# Copy CLAUDE.md templates if not present
+# Copy CLAUDE.md templates if not present, replacing default name with ASSISTANT_NAME
 for dir in main global; do
   if [ ! -f "$STATE_DIR/groups/$dir/CLAUDE.md" ]; then
-    cp "$REPO_DIR/groups/$dir/CLAUDE.md" "$STATE_DIR/groups/$dir/CLAUDE.md" 2>/dev/null || true
+    if [ -f "$REPO_DIR/groups/$dir/CLAUDE.md" ]; then
+      if [ -n "$ASSISTANT_NAME" ] && [ "$ASSISTANT_NAME" != "Andy" ]; then
+        sed "s/Andy/$ASSISTANT_NAME/g" "$REPO_DIR/groups/$dir/CLAUDE.md" \
+          > "$STATE_DIR/groups/$dir/CLAUDE.md"
+      else
+        cp "$REPO_DIR/groups/$dir/CLAUDE.md" "$STATE_DIR/groups/$dir/CLAUDE.md"
+      fi
+    fi
   fi
 done
+
+# Update assistant name in existing CLAUDE.md files if it changed
+if [ -n "$ASSISTANT_NAME" ] && [ "$ASSISTANT_NAME" != "Andy" ]; then
+  for f in "$STATE_DIR"/groups/*/CLAUDE.md; do
+    [ -f "$f" ] && sed -i "s/Andy/$ASSISTANT_NAME/g" "$f"
+  done
+fi
 
 # --- Auto-merge env vars into state/.env ---
 touch "$STATE_DIR/.env"
@@ -61,7 +75,8 @@ grep -q '.nanoclaw-env' /home/nanoclaw/.bashrc 2>/dev/null || \
 
 # Own state dir and writable app dirs (not /app/repo which is read-only)
 chown -R nanoclaw:nanoclaw "$STATE_DIR"
-chown -R nanoclaw:nanoclaw /app/node_modules /app/package.json /app/package-lock.json /app/host-entrypoint.sh 2>/dev/null || true
+chown -R nanoclaw:nanoclaw /app/node_modules /app/dist /app/package.json /app/package-lock.json /app/host-entrypoint.sh 2>/dev/null || true
+mkdir -p /app/dist && chown nanoclaw:nanoclaw /app/dist
 
 # Refresh node_modules if package.json changed
 if ! diff -q "$REPO_DIR/package.json" /app/package.json > /dev/null 2>&1; then

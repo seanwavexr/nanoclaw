@@ -396,9 +396,15 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
+      systemPrompt: (() => {
+        const identityPrompt = containerInput.assistantName
+          ? `\nIMPORTANT: Your name is ${containerInput.assistantName}. You are NOT Claude. Always refer to yourself as ${containerInput.assistantName}.\n`
+          : '';
+        const append = (globalClaudeMd || '') + identityPrompt;
+        return append.trim()
+          ? { type: 'preset' as const, preset: 'claude_code' as const, append }
+          : undefined;
+      })(),
       allowedTools: [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
