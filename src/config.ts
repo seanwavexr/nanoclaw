@@ -70,6 +70,22 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
+export const MAX_WORKER_CHILD_CONTAINERS = Math.max(
+  0,
+  parseInt(process.env.MAX_WORKER_CHILD_CONTAINERS || '1', 10),
+);
+export const WORKER_PORT_RANGE_START = parseInt(
+  process.env.WORKER_PORT_RANGE_START || '8900',
+  10,
+);
+export const WORKER_PORT_RANGE_END = parseInt(
+  process.env.WORKER_PORT_RANGE_END || '9000',
+  10,
+);
+export const WORKER_CONTAINER_BUILD_TIMEOUT = parseInt(
+  process.env.WORKER_CONTAINER_BUILD_TIMEOUT || '300000',
+  10,
+);
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

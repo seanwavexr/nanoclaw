@@ -174,9 +174,25 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'containers', 'responses'), {
+    recursive: true,
+  });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
+    readonly: false,
+  });
+
+  // Per-group worker containers work folder (Dockerfiles, build context)
+  const workerContainersDir = path.join(
+    DATA_DIR,
+    'worker-containers',
+    group.folder,
+  );
+  fs.mkdirSync(workerContainersDir, { recursive: true });
+  mounts.push({
+    hostPath: workerContainersDir,
+    containerPath: '/workspace/containers',
     readonly: false,
   });
 
@@ -197,6 +213,15 @@ function buildVolumeMounts(
   );
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  } else if (fs.existsSync(agentRunnerSrc) && fs.existsSync(groupAgentRunnerDir)) {
+    // Always sync the NanoClaw-provided MCP server so new tools are available.
+    // Agents may customize other files in agent-runner-src, but ipc-mcp-stdio.ts
+    // is the host IPC bridge and must stay in sync with the host-side handlers.
+    const mcpSrc = path.join(agentRunnerSrc, 'ipc-mcp-stdio.ts');
+    const mcpDst = path.join(groupAgentRunnerDir, 'ipc-mcp-stdio.ts');
+    if (fs.existsSync(mcpSrc)) {
+      fs.cpSync(mcpSrc, mcpDst);
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -222,7 +247,7 @@ function buildVolumeMounts(
  * When NanoClaw runs inside a container, docker -v paths must reference host paths
  * because agent containers are siblings (not children).
  */
-function toHostPath(localPath: string): string {
+export function toHostPath(localPath: string): string {
   if (!DOCKER_HOST_REPO_PATH) return localPath; // not containerized
 
   const stateDir = process.env.NANOCLAW_STATE_DIR || '';

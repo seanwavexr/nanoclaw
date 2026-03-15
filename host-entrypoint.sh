@@ -85,6 +85,7 @@ if ! diff -q "$REPO_DIR/package.json" /app/package.json > /dev/null 2>&1; then
 fi
 
 # Compile TypeScript from mounted repo
+rm -rf /app/src
 cp -r "$REPO_DIR/src" /app/src
 cp "$REPO_DIR/tsconfig.json" /app/tsconfig.json
 gosu nanoclaw npx tsc

@@ -14,6 +14,8 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const CONTAINERS_DIR = path.join(IPC_DIR, 'containers');
+const CONTAINER_RESPONSES_DIR = path.join(CONTAINERS_DIR, 'responses');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -330,6 +332,280 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+// --- Container management tools ---
+
+async function writeContainerRequest(
+  data: object,
+  timeoutMs = 30000,
+): Promise<object> {
+  const responseId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const requestData = { ...data, responseId };
+
+  fs.mkdirSync(CONTAINERS_DIR, { recursive: true });
+  fs.mkdirSync(CONTAINER_RESPONSES_DIR, { recursive: true });
+
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filepath = path.join(CONTAINERS_DIR, filename);
+  const tempPath = `${filepath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(requestData, null, 2));
+  fs.renameSync(tempPath, filepath);
+
+  // Poll for response
+  const responseFile = path.join(CONTAINER_RESPONSES_DIR, `${responseId}.json`);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (fs.existsSync(responseFile)) {
+      const content = fs.readFileSync(responseFile, 'utf-8');
+      fs.unlinkSync(responseFile);
+      return JSON.parse(content);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Container operation timed out after ${timeoutMs}ms`);
+}
+
+server.tool(
+  'container_build',
+  `Build and run a Docker container from a Dockerfile in /workspace/containers/.
+
+Write your Dockerfile and any build context files to /workspace/containers/ first (using the Write tool), then call this tool.
+Host ports must be in the range 8900-9000. The container runs detached and persists even after your session ends.
+
+VOLUMES: To persist data across container rebuilds, mount subdirectories of /workspace/containers/ into the child container.
+For example: volumes: ["/workspace/containers/myapp-data:/app/data"] — the data in /workspace/containers/myapp-data/ survives even if you destroy and rebuild the container.
+Create the data directory structure under /workspace/containers/ before building, or it will be auto-created as an empty directory.`,
+  {
+    ports: z
+      .array(z.string())
+      .describe(
+        'Port mappings as "hostPort:containerPort" (e.g., ["8900:80", "8901:3000"]). Host ports must be 8900-9000.',
+      ),
+    volumes: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Volume mounts as "/workspace/containers/subdir:/container/path" (e.g., ["/workspace/containers/data:/app/data"]). Source must be under /workspace/containers/.',
+      ),
+    dockerfile_path: z
+      .string()
+      .default('Dockerfile')
+      .describe(
+        'Path to Dockerfile relative to /workspace/containers/ (default: "Dockerfile")',
+      ),
+    image_name: z
+      .string()
+      .optional()
+      .describe('Custom image name (auto-generated if omitted)'),
+  },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_build',
+        ports: args.ports,
+        volumes: args.volumes || [],
+        dockerfile_path: args.dockerfile_path,
+        image_name: args.image_name,
+      }, 300000); // 5 min timeout for builds
+      const r = result as { success: boolean; error?: string; containerName?: string; containerId?: string; ports?: string[] };
+      if (r.success) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Container started: ${r.containerName} (${r.containerId})\nPorts: ${(r.ports || []).join(', ')}`,
+          }],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: `Build failed: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_list',
+  'List all Docker containers owned by this worker.',
+  {},
+  async () => {
+    try {
+      const result = await writeContainerRequest({ type: 'container_list' });
+      const r = result as { success: boolean; containers?: object[]; error?: string };
+      if (r.success) {
+        if (!r.containers || r.containers.length === 0) {
+          return { content: [{ type: 'text' as const, text: 'No containers running.' }] };
+        }
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(r.containers, null, 2) }],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_quota',
+  'Check how many containers this worker can still create.',
+  {},
+  async () => {
+    try {
+      const result = await writeContainerRequest({ type: 'container_quota' });
+      const r = result as { success: boolean; current?: number; max?: number; available?: number; error?: string };
+      if (r.success) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Containers: ${r.current}/${r.max} used, ${r.available} available`,
+          }],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_stop',
+  'Stop a running child container.',
+  { container_id: z.string().describe('Container ID or name') },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_stop',
+        container_id: args.container_id,
+      });
+      const r = result as { success: boolean; error?: string };
+      if (r.success) {
+        return { content: [{ type: 'text' as const, text: `Container ${args.container_id} stopped.` }] };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_restart',
+  'Restart a child container.',
+  { container_id: z.string().describe('Container ID or name') },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_restart',
+        container_id: args.container_id,
+      });
+      const r = result as { success: boolean; error?: string };
+      if (r.success) {
+        return { content: [{ type: 'text' as const, text: `Container ${args.container_id} restarted.` }] };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_destroy',
+  'Force-remove a child container (stop + delete).',
+  { container_id: z.string().describe('Container ID or name') },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_destroy',
+        container_id: args.container_id,
+      });
+      const r = result as { success: boolean; error?: string };
+      if (r.success) {
+        return { content: [{ type: 'text' as const, text: `Container ${args.container_id} destroyed.` }] };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_exec',
+  'Execute a command inside a running child container. Returns stdout/stderr. 30-second timeout.',
+  {
+    container_id: z.string().describe('Container ID or name'),
+    command: z.string().describe('Shell command to run (executed via sh -c)'),
+  },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_exec',
+        container_id: args.container_id,
+        command: args.command,
+      });
+      const r = result as { success: boolean; output?: string; stdout?: string; error?: string };
+      if (r.success) {
+        return { content: [{ type: 'text' as const, text: r.output || '(no output)' }] };
+      }
+      const output = r.stdout ? `\nStdout: ${r.stdout}` : '';
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}${output}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'container_logs',
+  'Get recent logs from a child container.',
+  {
+    container_id: z.string().describe('Container ID or name'),
+    tail: z.number().default(100).describe('Number of lines to return (default: 100)'),
+  },
+  async (args) => {
+    try {
+      const result = await writeContainerRequest({
+        type: 'container_logs',
+        container_id: args.container_id,
+        tail: args.tail,
+      });
+      const r = result as { success: boolean; logs?: string; error?: string };
+      if (r.success) {
+        return { content: [{ type: 'text' as const, text: r.logs || '(no logs)' }] };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }], isError: true };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
   },
 );
 

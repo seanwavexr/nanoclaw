@@ -9,6 +9,10 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+import {
+  ContainerIpcDeps,
+  processContainerIpc,
+} from './worker-containers.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -143,6 +147,51 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process container operations from this group's IPC directory
+      const containersDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'containers',
+      );
+      try {
+        if (fs.existsSync(containersDir)) {
+          const containerFiles = fs
+            .readdirSync(containersDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of containerFiles) {
+            const filePath = path.join(containersDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              fs.unlinkSync(filePath);
+              const containerDeps: ContainerIpcDeps = {
+                registeredGroups: deps.registeredGroups,
+              };
+              await processContainerIpc(data, sourceGroup, containerDeps);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC container request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              try {
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* file already deleted */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC containers directory',
+        );
       }
     }
 

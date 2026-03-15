@@ -100,14 +100,23 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
-/** Kill orphaned NanoClaw containers from previous runs. */
+/** Kill orphaned NanoClaw worker containers from previous runs.
+ *  Child containers (nanoclaw.child-container=true) are NOT stopped here
+ *  — they persist across worker restarts by design. */
 export function cleanupOrphans(): void {
   try {
     const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=nanoclaw.managed --format '{{.Names}}'`,
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=nanoclaw.managed --format '{{.Names}} {{.Labels}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
-    const orphans = output.trim().split('\n').filter(Boolean);
+    const lines = output.trim().split('\n').filter(Boolean);
+    const orphans: string[] = [];
+    for (const line of lines) {
+      // Skip child containers — they should persist
+      if (line.includes('nanoclaw.child-container=true')) continue;
+      const name = line.split(' ')[0];
+      if (name) orphans.push(name);
+    }
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });
