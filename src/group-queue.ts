@@ -75,9 +75,9 @@ export class GroupQueue {
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
       }
-      logger.debug(
-        { groupJid, activeCount: this.activeCount },
-        'At concurrency limit, message queued',
+      logger.warn(
+        { groupJid, activeCount: this.activeCount, limit: MAX_CONCURRENT_CONTAINERS },
+        'At concurrency limit, message queued — response will be delayed',
       );
       return;
     }
@@ -116,9 +116,9 @@ export class GroupQueue {
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
       }
-      logger.debug(
-        { groupJid, taskId, activeCount: this.activeCount },
-        'At concurrency limit, task queued',
+      logger.warn(
+        { groupJid, taskId, activeCount: this.activeCount, limit: MAX_CONCURRENT_CONTAINERS },
+        'At concurrency limit, task queued — execution will be delayed',
       );
       return;
     }

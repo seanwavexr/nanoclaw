@@ -1,3 +1,4 @@
 #!/bin/sh
 
-claude --resume --dangerously-skip-permissions
+claude --dangerously-skip-permissions
+

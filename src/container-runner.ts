@@ -19,6 +19,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   NANOCLAW_LABEL,
+  SOLVY_ENABLED,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -196,6 +197,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Solvy plansolver DB directory (persistent across container restarts)
+  if (SOLVY_ENABLED) {
+    const solvyDbDir = path.join(DATA_DIR, 'plansolver', group.folder);
+    fs.mkdirSync(solvyDbDir, { recursive: true });
+    mounts.push({
+      hostPath: solvyDbDir,
+      containerPath: '/workspace/plansolver',
+      readonly: false,
+    });
+  }
+
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
@@ -211,17 +223,10 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  // Always sync agent-runner source so all groups get updates (new tools,
+  // bug fixes, logging changes). Recompiled on container startup.
+  if (fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-  } else if (fs.existsSync(agentRunnerSrc) && fs.existsSync(groupAgentRunnerDir)) {
-    // Always sync the NanoClaw-provided MCP server so new tools are available.
-    // Agents may customize other files in agent-runner-src, but ipc-mcp-stdio.ts
-    // is the host IPC bridge and must stay in sync with the host-side handlers.
-    const mcpSrc = path.join(agentRunnerSrc, 'ipc-mcp-stdio.ts');
-    const mcpDst = path.join(groupAgentRunnerDir, 'ipc-mcp-stdio.ts');
-    if (fs.existsSync(mcpSrc)) {
-      fs.cpSync(mcpSrc, mcpDst);
-    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -275,6 +280,17 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Solvy MCP feature flag and configuration
+  if (SOLVY_ENABLED) {
+    args.push('-e', 'SOLVY_ENABLED=1');
+    // Forward SOLVY_* configuration env vars so they reach the MCP server process
+    for (const [key, value] of Object.entries(process.env)) {
+      if (key.startsWith('SOLVY_') && key !== 'SOLVY_ENABLED' && value) {
+        args.push('-e', `${key}=${value}`);
+      }
+    }
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(

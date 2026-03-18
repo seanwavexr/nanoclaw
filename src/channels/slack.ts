@@ -1,9 +1,13 @@
+import fs from 'fs';
+import path from 'path';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -18,9 +22,33 @@ import {
 const MAX_MESSAGE_LENGTH = 4000;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
-// we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
-// (BotMessageEvent, subtype 'bot_message') so we can track our own output.
+// we filter to regular messages (GenericMessageEvent, subtype undefined), bot messages
+// (BotMessageEvent, subtype 'bot_message'), and file_share (file uploads including audio).
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
+
+interface SlackFile {
+  mimetype?: string;
+  filetype?: string;
+  name?: string;
+  url_private_download?: string;
+  url_private?: string;
+  size?: number;
+}
+
+/** Check if a file is a downloadable media type (audio/video/image). */
+function isDownloadableMedia(file: SlackFile): boolean {
+  const mime = file.mimetype || '';
+  return mime.startsWith('audio/') || mime.startsWith('video/') || mime.startsWith('image/');
+}
+
+/** Map Slack file to a human-readable placeholder. */
+function describeFile(file: SlackFile): string {
+  const mime = file.mimetype || '';
+  if (mime.startsWith('audio/')) return `[Audio: ${file.name || 'audio'}]`;
+  if (mime.startsWith('video/')) return `[Video: ${file.name || 'video'}]`;
+  if (mime.startsWith('image/')) return `[Image: ${file.name || 'image'}]`;
+  return `[File: ${file.name || file.filetype || 'attachment'}]`;
+}
 
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
@@ -32,6 +60,7 @@ export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private botToken: string;
   private botUserId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
@@ -55,6 +84,7 @@ export class SlackChannel implements Channel {
       );
     }
 
+    this.botToken = botToken;
     this.app = new App({
       token: botToken,
       appToken,
@@ -72,12 +102,13 @@ export class SlackChannel implements Channel {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
-      if (subtype && subtype !== 'bot_message') return;
+      const files = (event as { files?: SlackFile[] }).files;
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
 
-      if (!msg.text) return;
+      if (!msg.text && (!files || files.length === 0)) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -97,6 +128,25 @@ export class SlackChannel implements Channel {
       const isBotMessage =
         !!msg.bot_id || msg.user === this.botUserId;
 
+      // Download media files to the group's media directory
+      const fileParts: string[] = [];
+      if (files && files.length > 0 && !isBotMessage) {
+        const group = groups[jid];
+        for (const file of files) {
+          if (isDownloadableMedia(file)) {
+            const localPath = await this.downloadFile(file, group.folder, msg.ts);
+            if (localPath) {
+              // Container sees group folder at /workspace/group
+              const containerPath = `/workspace/group/media/${path.basename(localPath)}`;
+              fileParts.push(`[${describeFile(file)} saved to ${containerPath}]`);
+              continue;
+            }
+          }
+          // Fallback: just describe the file
+          fileParts.push(describeFile(file));
+        }
+      }
+
       let senderName: string;
       if (isBotMessage) {
         senderName = ASSISTANT_NAME;
@@ -110,7 +160,7 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
+      let content = [msg.text, ...fileParts].filter(Boolean).join('\n');
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
         if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
@@ -153,8 +203,10 @@ export class SlackChannel implements Channel {
     // Flush any messages queued before connection
     await this.flushOutgoingQueue();
 
-    // Sync channel names on startup
-    await this.syncChannelMetadata();
+    // Sync channel names in the background — don't block startup
+    this.syncChannelMetadata().catch((err) =>
+      logger.error({ err }, 'Background Slack channel sync failed'),
+    );
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -242,6 +294,47 @@ export class SlackChannel implements Channel {
       logger.info({ count }, 'Slack channel metadata synced');
     } catch (err) {
       logger.error({ err }, 'Failed to sync Slack channel metadata');
+    }
+  }
+
+  /**
+   * Download a Slack file to the group's media directory.
+   * Returns the local file path on success, or null on failure.
+   */
+  private async downloadFile(
+    file: SlackFile,
+    groupFolder: string,
+    messageTs: string,
+  ): Promise<string | null> {
+    const url = file.url_private_download || file.url_private;
+    if (!url) return null;
+
+    try {
+      const groupDir = resolveGroupFolderPath(groupFolder);
+      const mediaDir = path.join(groupDir, 'media');
+      fs.mkdirSync(mediaDir, { recursive: true });
+
+      // Use timestamp + original filename to avoid collisions
+      const safeName = (file.name || `file.${file.filetype || 'bin'}`)
+        .replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filename = `${messageTs.replace('.', '_')}-${safeName}`;
+      const filePath = path.join(mediaDir, filename);
+
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.botToken}` },
+      });
+      if (!response.ok) {
+        logger.warn({ url, status: response.status }, 'Failed to download Slack file');
+        return null;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      fs.writeFileSync(filePath, buffer);
+      logger.info({ filePath, size: buffer.length }, 'Downloaded Slack file');
+      return filePath;
+    } catch (err) {
+      logger.warn({ err, fileName: file.name }, 'Error downloading Slack file');
+      return null;
     }
   }
 

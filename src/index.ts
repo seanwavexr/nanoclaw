@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
+
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
@@ -67,6 +68,7 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const rebootRecoveryGroups = new Set<string>();
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -162,27 +164,43 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ASSISTANT_NAME,
   );
 
-  if (missedMessages.length === 0) return true;
+  const isRebootRecovery = rebootRecoveryGroups.delete(chatJid);
 
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  if (missedMessages.length === 0 && !isRebootRecovery) return true;
+
+  // Skip trigger check for reboot recovery with no messages
+  if (missedMessages.length > 0 && !isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
         TRIGGER_PATTERN.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
-    if (!hasTrigger) return true;
+    if (!hasTrigger) {
+      logger.debug(
+        { group: group.name, messageCount: missedMessages.length },
+        'No trigger found in pending messages, skipping (waiting for @mention)',
+      );
+      return true;
+    }
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const rebootPreamble = isRebootRecovery
+    ? '[SYSTEM REBOOT] The system has restarted. Check for any in-progress tasks or goals that need to be continued, and progress them. If there is nothing to continue, do nothing.\n\n'
+    : '';
+
+  const prompt = missedMessages.length > 0
+    ? rebootPreamble + formatMessages(missedMessages, TIMEZONE)
+    : rebootPreamble.trim();
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
+  if (missedMessages.length > 0) {
+    lastAgentTimestamp[chatJid] =
+      missedMessages[missedMessages.length - 1].timestamp;
+    saveState();
+  }
 
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
@@ -220,12 +238,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+      } else {
+        logger.warn(
+          { group: group.name },
+          'Agent produced output but it was entirely stripped (all content in <internal> blocks) — nothing sent to user',
+        );
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
     }
 
-    if (result.status === 'success') {
+    // Reset idle timer on ANY output — including null-result activity markers
+    // from task_notification events, so long-running tasks keep the container alive
+    resetIdleTimer();
+
+    // Only mark container as idle on actual results (non-null), not heartbeats.
+    // notifyIdle sets idleWaiting=true and may closeStdin if tasks are pending.
+    if (result.result && result.status === 'success') {
       queue.notifyIdle(chatJid);
     }
 
@@ -401,7 +428,13 @@ async function startMessageLoop(): Promise<void> {
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
-            if (!hasTrigger) continue;
+            if (!hasTrigger) {
+              logger.debug(
+                { chatJid, group: group.name, messageCount: groupMessages.length },
+                'No trigger found, messages stored for context (waiting for @mention)',
+              );
+              continue;
+            }
           }
 
           // Pull all messages since lastAgentTimestamp so non-trigger
@@ -457,6 +490,22 @@ function recoverPendingMessages(): void {
       );
       queue.enqueueMessageCheck(chatJid);
     }
+  }
+}
+
+function scheduleRebootRecovery(): void {
+  for (const [chatJid, group] of Object.entries(registeredGroups)) {
+    // Only recover groups that have an existing session (i.e., the agent has context to resume)
+    if (!sessions[group.folder]) continue;
+
+    rebootRecoveryGroups.add(chatJid);
+    queue.enqueueMessageCheck(chatJid);
+  }
+  if (rebootRecoveryGroups.size > 0) {
+    logger.info(
+      { count: rebootRecoveryGroups.size },
+      'Scheduled reboot recovery for groups with active sessions',
+    );
   }
 }
 
@@ -582,6 +631,7 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+  scheduleRebootRecovery();
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);

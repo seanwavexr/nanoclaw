@@ -13,6 +13,8 @@ export const ASSISTANT_NAME =
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+export const SOLVY_ENABLED =
+  (process.env.SOLVY_ENABLED) === 'true';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
@@ -72,7 +74,7 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
 );
 export const MAX_WORKER_CHILD_CONTAINERS = Math.max(
   0,
-  parseInt(process.env.MAX_WORKER_CHILD_CONTAINERS || '1', 10),
+  parseInt(process.env.MAX_WORKER_CHILD_CONTAINERS || '3', 10),
 );
 export const WORKER_PORT_RANGE_START = parseInt(
   process.env.WORKER_PORT_RANGE_START || '8900',

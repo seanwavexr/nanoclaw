@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     volumes:
       - .:/app/repo
+      - ./CLAUDE.host.md:/app/repo/CLAUDE.md
       - ${NANOCLAW_HOST_DIR:-../nanoclaw-host}:/app/state
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
@@ -25,3 +26,5 @@ services:
       - ASSISTANT_HAS_OWN_NUMBER=${ASSISTANT_HAS_OWN_NUMBER:-}
       - TZ=${TZ:-UTC}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Solvy plan-solver (experimental)
+      - SOLVY_ENABLED=true

@@ -1,17 +1,21 @@
 /**
- * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
+ * NanoClaw Agent Runner — Single-Session Task Delegation Architecture
+ * Runs inside a container, receives config via stdin, outputs results to stdout.
+ *
+ * One persistent query() session runs for the container's lifetime. Every
+ * incoming message is pushed into the session as a [NEW MESSAGE], and the
+ * system prompt instructs Claude to delegate each to an SDK Task for parallel
+ * execution with shared context.
  *
  * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
+ *   Stdin: Full ContainerInput JSON (read until EOF)
  *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
  *          Files: {type:"message", text:"..."}.json — polled and consumed
  *          Sentinel: /workspace/ipc/input/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
- *   Final marker after loop ends signals completion.
+ *   Multiple results may be emitted (one per task result / agent teams result).
  */
 
 import fs from 'fs';
@@ -56,7 +60,10 @@ interface SDKUserMessage {
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+const IPC_MESSAGES_DIR = '/workspace/ipc/messages';
 const IPC_POLL_MS = 500;
+
+// --- MessageStream ---
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -93,6 +100,8 @@ class MessageStream {
     }
   }
 }
+
+// --- Utility functions ---
 
 async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -301,71 +310,15 @@ function drainIpcInput(): string[] {
   }
 }
 
-/**
- * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
- */
-function waitForIpcMessage(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        resolve(messages.join('\n'));
-        return;
-      }
-      setTimeout(poll, IPC_POLL_MS);
-    };
-    poll();
-  });
-}
+// --- Shared SDK configuration ---
 
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
- */
-async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
+function buildSdkOptions(
   containerInput: ContainerInput,
+  mcpServerPath: string,
   sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
-
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
-
+  abortController: AbortController,
+  stream: MessageStream,
+) {
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
@@ -374,7 +327,6 @@ async function runQuery(
   }
 
   // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
   const extraBase = '/workspace/extra';
   if (fs.existsSync(extraBase)) {
@@ -385,22 +337,34 @@ async function runQuery(
       }
     }
   }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
 
-  for await (const message of query({
-    prompt: stream,
+  const solvyEnabled = process.env.SOLVY_ENABLED === '1';
+
+  return {
+    prompt: stream as AsyncIterable<SDKUserMessage>,
     options: {
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
+      abortController,
       systemPrompt: (() => {
         const identityPrompt = containerInput.assistantName
           ? `\nIMPORTANT: Your name is ${containerInput.assistantName}. You are NOT Claude. Always refer to yourself as ${containerInput.assistantName}.\n`
           : '';
-        const append = (globalClaudeMd || '') + identityPrompt;
+        const behaviorPrompt = `
+IMPORTANT: You are a persistent assistant managing concurrent tasks.
+
+TASK DELEGATION: Every incoming user message (prefixed with [NEW MESSAGE]) MUST be handled in one of two ways, depending on the most appropriate solution for the incoming user message. In each case, it's important to give the user immediate feedback:
+1. If it's a simple request that you can immediately respond to in less than 10 seconds, process the message inline and use the send_message tool to deliver results to the user.
+2. Otherwise, it's a more complex request and it MUST be handled by creating a Task for it using the Task tool. Before engaging the Task tool, use the send_message tool to tell the user that it will take a moment. Each Task should process the user's request fully, and then use the send_message tool to deliver results from the Task to the user.
+`;
+
+// TASK DELEGATION: Every incoming user message (prefixed with [NEW MESSAGE]) MUST be handled by creating a Task for it using the Task tool. Never handle [NEW MESSAGE] content inline — always delegate to a Task. Each Task should:
+// 1. Process the user's request fully
+// 2. Use the send_message tool to deliver results to the user
+//
+// ACKNOWLEDGMENT: Remember, if the Task will take more than 10 seconds to process, use send_message to send a brief acknowledgment like "Working on that..." to the user. For quick tasks, skip the acknowledgment.
+
+        const append = (globalClaudeMd || '') + identityPrompt + behaviorPrompt;
         return append.trim()
           ? { type: 'preset' as const, preset: 'claude_code' as const, append }
           : undefined;
@@ -413,12 +377,13 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...(solvyEnabled ? ['mcp__solvy__*'] : []),
       ],
       env: sdkEnv,
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'bypassPermissions' as const,
       allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
+      settingSources: ['project' as const, 'user' as const],
       mcpServers: {
         nanoclaw: {
           command: 'node',
@@ -429,45 +394,23 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...(solvyEnabled ? {
+          solvy: {
+            command: 'node',
+            args: [path.join(path.dirname(mcpServerPath), 'solvy', 'index.js')],
+            env: {
+              SOLVY_DB_DIR: '/workspace/plansolver/',
+              SOLVY_WORKSPACE_PREFIX: '/workspace/group/',
+              SOLVY_GIT_ROOT: '/workspace/group/',
+            },
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
-
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
-
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
-
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
-
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
-    }
-  }
-
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+    },
+  };
 }
 
 async function main(): Promise<void> {
@@ -494,10 +437,9 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
-  let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
-  // Clean up stale _close sentinel from previous container runs
+  // Clean up stale files from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
@@ -511,50 +453,95 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
-  // Query loop: run query → wait for IPC message → run new query → repeat
-  let resumeAt: string | undefined;
+  // Create ONE MessageStream and ONE AbortController for the session
+  const stream = new MessageStream();
+  const abortController = new AbortController();
+
+  // Build SDK options with stream as prompt
+  const sdkOptions = buildSdkOptions(containerInput, mcpServerPath, sdkEnv, abortController, stream);
+
+  // Resume session if available
+  if (containerInput.sessionId) {
+    (sdkOptions.options as Record<string, unknown>).resume = containerInput.sessionId;
+  }
+
+  // Push first message
+  let lastUserMessage = `[NEW MESSAGE]\n\n${prompt}`;
+  let awaitingResult = true;
+  stream.push(lastUserMessage);
+
+  let newSessionId: string | undefined;
+  let lastHeartbeat = 0;
+  const HEARTBEAT_INTERVAL_MS = 30_000; // at most once per 30s
+
   try {
-    while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
-
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
+    // Run query() and IPC dispatcher concurrently
+    const queryPromise = (async () => {
+      for await (const message of query(sdkOptions)) {
+        if (message.type === 'system' && message.subtype === 'init') {
+          newSessionId = message.session_id;
+          log(`Session initialized: ${newSessionId}`);
+        }
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          log('Compaction completed');
+          if (awaitingResult && lastUserMessage) {
+            log('Re-injecting last user message after compaction');
+            stream.push(`[REMINDER — your previous context was compacted before you could respond. Please handle this message now.]\n\n${lastUserMessage}`);
+          }
+        }
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+          // Signal activity to host (resets idle timer)
+          writeOutput({ status: 'success', result: null, newSessionId });
+        }
+        if (message.type === 'assistant') {
+          // Throttled heartbeat on assistant messages (tool calls, thinking, etc.)
+          // so long-running tasks signal activity to the host
+          const now = Date.now();
+          if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+            lastHeartbeat = now;
+            writeOutput({ status: 'success', result: null, newSessionId });
+          }
+        }
+        if (message.type === 'result') {
+          awaitingResult = false;
+          const textResult = 'result' in message ? (message as { result?: string }).result : null;
+          log(`Result: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+          writeOutput({ status: 'success', result: textResult || null, newSessionId });
+        }
       }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
+    })();
+
+    // IPC dispatcher loop (polls for new messages, pushes into stream)
+    const dispatcherLoop = (async () => {
+      while (true) {
+        if (shouldClose()) {
+          log('Close sentinel detected, ending stream');
+          stream.end();
+          break;
+        }
+        const messages = drainIpcInput();
+        for (const text of messages) {
+          log(`New IPC message (${text.length} chars), pushing to stream`);
+          lastUserMessage = `[NEW MESSAGE]\n\n${text}`;
+          awaitingResult = true;
+          stream.push(lastUserMessage);
+        }
+        await new Promise(r => setTimeout(r, IPC_POLL_MS));
       }
+    })();
 
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
+    await Promise.all([queryPromise, dispatcherLoop]);
+    writeOutput({ status: 'success', result: null, newSessionId });
 
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
-    }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    abortController.abort();
+    stream.end();
     writeOutput({
       status: 'error',
       result: null,
-      newSessionId: sessionId,
+      newSessionId,
       error: errorMessage
     });
     process.exit(1);
