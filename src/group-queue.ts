@@ -344,6 +344,34 @@ export class GroupQueue {
     }
   }
 
+  getActiveContainers(): Array<{
+    groupJid: string;
+    containerName: string;
+    groupFolder: string;
+    isTask: boolean;
+    idle: boolean;
+  }> {
+    const result: Array<{
+      groupJid: string;
+      containerName: string;
+      groupFolder: string;
+      isTask: boolean;
+      idle: boolean;
+    }> = [];
+    for (const [groupJid, state] of this.groups) {
+      if (state.active && state.containerName && state.groupFolder) {
+        result.push({
+          groupJid,
+          containerName: state.containerName,
+          groupFolder: state.groupFolder,
+          isTask: state.isTaskContainer,
+          idle: state.idleWaiting,
+        });
+      }
+    }
+    return result;
+  }
+
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 

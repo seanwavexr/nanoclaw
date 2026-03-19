@@ -328,6 +328,17 @@ export class SlackChannel implements Channel {
         return null;
       }
 
+      // Slack returns HTML login/OAuth pages (200 OK) when the token lacks
+      // files:read scope or has been revoked — detect and reject.
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        logger.warn(
+          { url, contentType },
+          'Slack file download returned HTML instead of file data — check bot token and files:read scope',
+        );
+        return null;
+      }
+
       const buffer = Buffer.from(await response.arrayBuffer());
       fs.writeFileSync(filePath, buffer);
       logger.info({ filePath, size: buffer.length }, 'Downloaded Slack file');

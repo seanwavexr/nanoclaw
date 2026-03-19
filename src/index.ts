@@ -4,6 +4,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DASHBOARD_PORT,
   IDLE_TIMEOUT,
 
   POLL_INTERVAL,
@@ -56,6 +57,7 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { startDashboard } from './dashboard.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -526,9 +528,17 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start activity dashboard
+  const dashboardServer = startDashboard(
+    DASHBOARD_PORT,
+    queue,
+    () => registeredGroups,
+  );
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    dashboardServer.close();
     proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();

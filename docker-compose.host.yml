@@ -14,6 +14,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "3001:3001"
+      - "3002:3002"
     environment:
       # Required: host paths for sibling container volume mounts
       - DOCKER_HOST_REPO_PATH=${DOCKER_HOST_REPO_PATH}

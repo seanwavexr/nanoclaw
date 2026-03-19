@@ -33,11 +33,19 @@ interface ContainerInput {
   assistantName?: string;
 }
 
+interface ActivityEvent {
+  type: 'tool_use' | 'tool_result' | 'text' | 'thinking' | 'result' | 'error' | 'system';
+  summary: string;
+  detail?: string;
+  timestamp: string;
+}
+
 interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
   error?: string;
+  activity?: ActivityEvent;
 }
 
 interface SessionEntry {
@@ -124,6 +132,14 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max) + '…' : str;
+}
+
+function emitActivity(event: ActivityEvent): void {
+  writeOutput({ status: 'success', result: null, activity: event });
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -356,6 +372,8 @@ IMPORTANT: You are a persistent assistant managing concurrent tasks.
 TASK DELEGATION: Every incoming user message (prefixed with [NEW MESSAGE]) MUST be handled in one of two ways, depending on the most appropriate solution for the incoming user message. In each case, it's important to give the user immediate feedback:
 1. If it's a simple request that you can immediately respond to in less than 10 seconds, process the message inline and use the send_message tool to deliver results to the user.
 2. Otherwise, it's a more complex request and it MUST be handled by creating a Task for it using the Task tool. Before engaging the Task tool, use the send_message tool to tell the user that it will take a moment. Each Task should process the user's request fully, and then use the send_message tool to deliver results from the Task to the user.
+
+LONG-TERM TASKS: If a task requires ongoing work that cannot be completed in a single session (e.g., monitoring, multi-step projects, research over time), use the schedule_task MCP tool to schedule a recurring follow-up. This will wake you up periodically so you can check progress and continue. For example, schedule an interval of 3600000 (1 hour) or a cron expression for regular check-ins. Always prefer scheduling a follow-up over telling the user to remind you later.
 `;
 
 // TASK DELEGATION: Every incoming user message (prefixed with [NEW MESSAGE]) MUST be handled by creating a Task for it using the Task tool. Never handle [NEW MESSAGE] content inline — always delegate to a Task. Each Task should:
@@ -481,9 +499,19 @@ async function main(): Promise<void> {
         if (message.type === 'system' && message.subtype === 'init') {
           newSessionId = message.session_id;
           log(`Session initialized: ${newSessionId}`);
+          emitActivity({
+            type: 'system',
+            summary: 'Session initialized',
+            timestamp: new Date().toISOString(),
+          });
         }
         if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           log('Compaction completed');
+          emitActivity({
+            type: 'system',
+            summary: 'Context compacted',
+            timestamp: new Date().toISOString(),
+          });
           if (awaitingResult && lastUserMessage) {
             log('Re-injecting last user message after compaction');
             stream.push(`[REMINDER — your previous context was compacted before you could respond. Please handle this message now.]\n\n${lastUserMessage}`);
@@ -492,8 +520,52 @@ async function main(): Promise<void> {
         if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           // Signal activity to host (resets idle timer)
           writeOutput({ status: 'success', result: null, newSessionId });
+          emitActivity({
+            type: 'system',
+            summary: 'Task notification',
+            timestamp: new Date().toISOString(),
+          });
         }
         if (message.type === 'assistant') {
+          // Emit activity for each content block
+          const content = (message as { message?: { content?: Array<{ type: string; name?: string; input?: unknown; text?: string; thinking?: string }> } }).message?.content;
+          if (content && Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === 'tool_use') {
+                const inputStr = typeof block.input === 'string'
+                  ? block.input
+                  : JSON.stringify(block.input || '');
+                emitActivity({
+                  type: 'tool_use',
+                  summary: `${block.name || 'tool'}`,
+                  detail: truncate(inputStr, 1000),
+                  timestamp: new Date().toISOString(),
+                });
+              } else if (block.type === 'tool_result') {
+                emitActivity({
+                  type: 'tool_result',
+                  summary: 'Tool result',
+                  detail: truncate(block.text || '', 1000),
+                  timestamp: new Date().toISOString(),
+                });
+              } else if (block.type === 'text' && block.text) {
+                emitActivity({
+                  type: 'text',
+                  summary: truncate(block.text, 120),
+                  detail: truncate(block.text, 1000),
+                  timestamp: new Date().toISOString(),
+                });
+              } else if (block.type === 'thinking' && block.thinking) {
+                emitActivity({
+                  type: 'thinking',
+                  summary: truncate(block.thinking, 120),
+                  detail: truncate(block.thinking, 1000),
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            }
+          }
+
           // Throttled heartbeat on assistant messages (tool calls, thinking, etc.)
           // so long-running tasks signal activity to the host
           const now = Date.now();
@@ -506,7 +578,17 @@ async function main(): Promise<void> {
           awaitingResult = false;
           const textResult = 'result' in message ? (message as { result?: string }).result : null;
           log(`Result: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-          writeOutput({ status: 'success', result: textResult || null, newSessionId });
+          writeOutput({
+            status: 'success',
+            result: textResult || null,
+            newSessionId,
+            activity: {
+              type: 'result',
+              summary: 'Result received',
+              detail: truncate(textResult || '', 1000),
+              timestamp: new Date().toISOString(),
+            },
+          });
         }
       }
     })();
@@ -542,7 +624,13 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId,
-      error: errorMessage
+      error: errorMessage,
+      activity: {
+        type: 'error',
+        summary: 'Agent error',
+        detail: truncate(errorMessage, 1000),
+        timestamp: new Date().toISOString(),
+      },
     });
     process.exit(1);
   }
